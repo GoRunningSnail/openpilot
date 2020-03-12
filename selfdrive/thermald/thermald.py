@@ -4,10 +4,9 @@ import json
 import copy
 import datetime
 import psutil
-import subprocess
 from smbus2 import SMBus
 from cereal import log
-from common.android import ANDROID, get_network_type
+from common.android import ANDROID, get_network_type, get_network_strength
 from common.basedir import BASEDIR
 from common.params import Params
 from common.realtime import sec_since_boot, DT_TRML
@@ -18,11 +17,13 @@ from selfdrive.swaglog import cloudlog
 import cereal.messaging as messaging
 from selfdrive.loggerd.config import get_available_percent
 from selfdrive.pandad import get_expected_signature
+from selfdrive.thermald.power_monitoring import PowerMonitoring, get_battery_capacity, get_battery_status, get_battery_current, get_battery_voltage, get_usb_present
 
 FW_SIGNATURE = get_expected_signature()
 
 ThermalStatus = log.ThermalData.ThermalStatus
 NetworkType = log.ThermalData.NetworkType
+NetworkStrength = log.ThermalData.NetworkStrength
 CURRENT_TAU = 15.   # 15s time constant
 DAYS_NO_CONNECTIVITY_MAX = 7  # do not allow to engage after a week without internet
 DAYS_NO_CONNECTIVITY_PROMPT = 4  # send an offroad prompt after 4 days with no internet
@@ -32,6 +33,9 @@ with open(BASEDIR + "/selfdrive/controls/lib/alerts_offroad.json") as json_file:
   OFFROAD_ALERTS = json.load(json_file)
 
 def read_tz(x, clip=True):
+  if not ANDROID:
+    # we don't monitor thermal on PC
+    return 0
   try:
     with open("/sys/devices/virtual/thermal/thermal_zone%d/temp" % x) as f:
       ret = int(f.read())
@@ -43,8 +47,7 @@ def read_tz(x, clip=True):
   return ret
 
 def read_thermal():
-  dat = messaging.new_message()
-  dat.init('thermal')
+  dat = messaging.new_message('thermal')
   dat.thermal.cpu0 = read_tz(5)
   dat.thermal.cpu1 = read_tz(7)
   dat.thermal.cpu2 = read_tz(10)
@@ -161,6 +164,7 @@ def thermald_thread():
   usb_power_prev = True
 
   network_type = NetworkType.none
+  network_strength = NetworkStrength.unknown
 
   current_filter = FirstOrderFilter(0., CURRENT_TAU, DT_TRML)
   health_prev = None
@@ -177,6 +181,7 @@ def thermald_thread():
     handle_fan = handle_fan_eon
 
   params = Params()
+  pm = PowerMonitoring()
 
   while 1:
     health = messaging.recv_sock(health_sock, wait=True)
@@ -196,27 +201,20 @@ def thermald_thread():
     if (count % int(10. / DT_TRML)) == 0:
       try:
         network_type = get_network_type()
-      except subprocess.CalledProcessError:
-        pass
+        network_strength = get_network_strength(network_type)
+      except Exception:
+        cloudlog.exception("Error getting network status")
 
     msg.thermal.freeSpace = get_available_percent(default=100.0) / 100.0
     msg.thermal.memUsedPercent = int(round(psutil.virtual_memory().percent))
     msg.thermal.cpuPerc = int(round(psutil.cpu_percent()))
     msg.thermal.networkType = network_type
-
-    try:
-      with open("/sys/class/power_supply/battery/capacity") as f:
-        msg.thermal.batteryPercent = int(f.read())
-      with open("/sys/class/power_supply/battery/status") as f:
-        msg.thermal.batteryStatus = f.read().strip()
-      with open("/sys/class/power_supply/battery/current_now") as f:
-        msg.thermal.batteryCurrent = int(f.read())
-      with open("/sys/class/power_supply/battery/voltage_now") as f:
-        msg.thermal.batteryVoltage = int(f.read())
-      with open("/sys/class/power_supply/usb/present") as f:
-        msg.thermal.usbOnline = bool(int(f.read()))
-    except FileNotFoundError:
-      pass
+    msg.thermal.networkStrength = network_strength
+    msg.thermal.batteryPercent = get_battery_capacity()
+    msg.thermal.batteryStatus = get_battery_status()
+    msg.thermal.batteryCurrent = get_battery_current()
+    msg.thermal.batteryVoltage = get_battery_voltage()
+    msg.thermal.usbOnline = get_usb_present()
 
     # Fake battery levels on uno for frame
     if is_uno:
@@ -363,6 +361,10 @@ def thermald_thread():
          started_seen and (sec_since_boot() - off_ts) > 60:
         os.system('LD_LIBRARY_PATH="" svc power shutdown')
 
+    # Offroad power monitoring
+    pm.calculate(health)
+    msg.thermal.offroadPowerUsage = pm.get_power_used()
+
     msg.thermal.chargingError = current_filter.x > 0. and msg.thermal.batteryPercent < 90  # if current is positive, then battery is being discharged
     msg.thermal.started = started_ts is not None
     msg.thermal.startedTs = int(1e9*(started_ts or 0))
@@ -393,7 +395,7 @@ def thermald_thread():
     count += 1
 
 
-def main(gctx=None):
+def main():
   thermald_thread()
 
 if __name__ == "__main__":
